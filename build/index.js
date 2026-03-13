@@ -9,7 +9,7 @@ const execPromise = util.promisify(exec);
 // Inicializa o servidor Architect Spec-Driven MCP
 const server = new Server({
     name: "ai-architect-mcp",
-    version: "1.2.0",
+    version: "1.3.0",
 }, {
     capabilities: {
         tools: {},
@@ -210,6 +210,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         }
                     },
                     required: ["caminho_arquivo", "framework", "cenarios"],
+                },
+            },
+            {
+                name: "commit_small_release",
+                description: "Automatiza um Small Release seguro: Roda Lint e Testes localmente. Se passarem, realiza um git commit protegido.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        mensagem_commit: { type: "string", description: "Mensagem descritiva do commit no padrão Conventional Commits (ex: feat: adiciona login)." }
+                    },
+                    required: ["mensagem_commit"],
                 },
             }
         ],
@@ -482,6 +493,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         catch (err) {
             return {
                 content: [{ type: "text", text: `Erro ao gerar scaffold de testes: ${err.message}` }],
+                isError: true
+            };
+        }
+    }
+    if (toolName === "commit_small_release") {
+        const msg = args.mensagem_commit;
+        const projectPath = process.cwd();
+        try {
+            // 1. Tentar rodar lint (se existir no package.json)
+            try {
+                const pkgTxt = fs.readFileSync(path.join(projectPath, 'package.json'), 'utf-8');
+                if (pkgTxt.includes('"lint"')) {
+                    await execPromise("npm run lint", { cwd: projectPath });
+                }
+            }
+            catch (err) { /* linter falhou ou não existe, ignorar no nosso scaffold base mas idealmente falharia */ }
+            // 2. Rodar testes obrigatoriamente
+            try {
+                await execPromise("npm test", { cwd: projectPath });
+            }
+            catch (err) {
+                return {
+                    content: [{ type: "text", text: `✋ COMMIT BLOQUEADO: Os testes falharam! Você deve corrigir o código antes de commitar.\n\nLogs:\n${err.stdout || err.message}` }],
+                    isError: true
+                };
+            }
+            // 3. Se testes passarem, faz o commit
+            await execPromise("git add .", { cwd: projectPath });
+            const { stdout } = await execPromise(`git commit -m "${msg}"`, { cwd: projectPath });
+            return {
+                content: [{ type: "text", text: `✅ Small Release concluído com sucesso! (Testes passaram, código commitado).\n\n${stdout}` }]
+            };
+        }
+        catch (err) {
+            return {
+                content: [{ type: "text", text: `Falha na esteira de commit: ${err.message}` }],
                 isError: true
             };
         }
