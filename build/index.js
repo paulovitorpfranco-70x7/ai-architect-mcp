@@ -1,38 +1,134 @@
+import { execFile } from "child_process";
+import fs from "fs";
+import path from "path";
+import util from "util";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
-import fs from "fs";
-import path from "path";
-import { exec } from "child_process";
-import util from "util";
-const execPromise = util.promisify(exec);
-// Inicializa o servidor Architect Spec-Driven MCP
+const execFilePromise = util.promisify(execFile);
+const SERVER_VERSION = "1.3.1";
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const projectRootProperty = {
+    type: "string",
+    description: "Raiz do projeto onde os arquivos e comandos devem ser resolvidos. Se omitida, o MCP usa --project-root, AI_ARCHITECT_PROJECT_ROOT ou process.cwd().",
+};
 const server = new Server({
     name: "ai-architect-mcp",
-    version: "1.3.0",
+    version: SERVER_VERSION,
 }, {
     capabilities: {
         tools: {},
     },
 });
-// Define as ferramentas que este MCP fornece para atuar como Arquiteto
+function textResponse(text, isError = false) {
+    return {
+        content: [{ type: "text", text }],
+        ...(isError ? { isError: true } : {}),
+    };
+}
+function withProjectRoot(properties = {}) {
+    return {
+        ...properties,
+        raiz_projeto: projectRootProperty,
+    };
+}
+function getStringArg(args, key) {
+    const value = args[key];
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+}
+function getStringArrayArg(args, key) {
+    const value = args[key];
+    if (!Array.isArray(value)) {
+        return undefined;
+    }
+    const items = value.filter((item) => typeof item === "string");
+    return items.length > 0 ? items : [];
+}
+function getCliProjectRoot() {
+    const flagIndex = process.argv.indexOf("--project-root");
+    if (flagIndex === -1) {
+        return undefined;
+    }
+    return process.argv[flagIndex + 1];
+}
+function normalizeProjectRoot(candidate) {
+    if (!candidate || !candidate.trim()) {
+        return undefined;
+    }
+    return path.resolve(process.cwd(), candidate.trim());
+}
+const configuredProjectRoot = normalizeProjectRoot(getCliProjectRoot()) ??
+    normalizeProjectRoot(process.env.AI_ARCHITECT_PROJECT_ROOT) ??
+    normalizeProjectRoot(process.env.MCP_PROJECT_ROOT) ??
+    normalizeProjectRoot(process.env.PROJECT_ROOT);
+function resolveProjectRoot(args) {
+    return (normalizeProjectRoot(getStringArg(args, "raiz_projeto")) ??
+        configuredProjectRoot ??
+        process.cwd());
+}
+function resolveProjectPath(projectRoot, filePath) {
+    return path.resolve(projectRoot, filePath);
+}
+function safeWriteFile(projectRoot, filePath, content) {
+    const absolutePath = resolveProjectPath(projectRoot, filePath);
+    const directory = path.dirname(absolutePath);
+    if (!fs.existsSync(directory)) {
+        fs.mkdirSync(directory, { recursive: true });
+    }
+    fs.writeFileSync(absolutePath, content, "utf-8");
+    return absolutePath;
+}
+function formatProjectRoot(projectRoot) {
+    return `Raiz do projeto: ${projectRoot}`;
+}
+function readPackageJson(projectRoot) {
+    const packageJsonPath = path.join(projectRoot, "package.json");
+    if (!fs.existsSync(packageJsonPath)) {
+        throw new Error(`package.json nao encontrado em ${packageJsonPath}`);
+    }
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+    const scripts = {};
+    Object.entries(packageJson.scripts ?? {}).forEach(([key, value]) => {
+        if (typeof value === "string") {
+            scripts[key] = value;
+        }
+    });
+    return { packageJsonPath, scripts };
+}
+async function runFileCommand(command, args, cwd) {
+    const result = await execFilePromise(command, args, {
+        cwd,
+        encoding: "utf-8",
+    });
+    return {
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+    };
+}
+async function ensureGitRepository(projectRoot) {
+    await runFileCommand("git", ["rev-parse", "--is-inside-work-tree"], projectRoot);
+}
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
         tools: [
             {
                 name: "iniciar_planejamento_projeto",
-                description: "Inicia o processo de planejamento de um novo projeto usando Spec-Driven Development e práticas de Clean Code.",
+                description: "Inicia o processo de planejamento de um novo projeto usando Spec-Driven Development e praticas de Clean Code.",
                 inputSchema: {
                     type: "object",
                     properties: {
                         objetivo_principal: {
                             type: "string",
-                            description: "O objetivo principal ou a ideia do projeto a ser construído.",
+                            description: "O objetivo principal ou a ideia do projeto a ser construido.",
                         },
                         tecnologias_desejadas: {
                             type: "array",
                             items: { type: "string" },
-                            description: "Lista de tecnologias preferidas pelo usuário (ex: React, Node.js, Python).",
+                            description: "Lista de tecnologias preferidas pelo usuario (ex: React, Node.js, Python).",
                         },
                     },
                     required: ["objetivo_principal"],
@@ -49,12 +145,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                             items: {
                                 type: "object",
                                 properties: {
-                                    nome: { type: "string", description: "Nome da funcionalidade (ex: Autenticação)" },
-                                    condicao_previa: { type: "string", description: "Condição para a funcionalidade ocorrer (ex: o usuário não estar logado)" },
-                                    evento_gatilho: { type: "string", description: "Ação que dispara a funcionalidade (ex: clicar no botão de login)" },
-                                    resposta_esperada: { type: "string", description: "O que o sistema deve fazer (ex: validar as credenciais e emitir um token)" }
+                                    nome: {
+                                        type: "string",
+                                        description: "Nome da funcionalidade (ex: Autenticacao)",
+                                    },
+                                    condicao_previa: {
+                                        type: "string",
+                                        description: "Condicao para a funcionalidade ocorrer (ex: o usuario nao estar logado)",
+                                    },
+                                    evento_gatilho: {
+                                        type: "string",
+                                        description: "Acao que dispara a funcionalidade (ex: clicar no botao de login)",
+                                    },
+                                    resposta_esperada: {
+                                        type: "string",
+                                        description: "O que o sistema deve fazer (ex: validar as credenciais e emitir um token)",
+                                    },
                                 },
-                                required: ["nome", "condicao_previa", "evento_gatilho", "resposta_esperada"]
+                                required: [
+                                    "nome",
+                                    "condicao_previa",
+                                    "evento_gatilho",
+                                    "resposta_esperada",
+                                ],
                             },
                             description: "Lista detalhada das funcionalidades para gerar o EARS.",
                         },
@@ -64,14 +177,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "sugerir_arquitetura_clean_code",
-                description: "Fornece uma sugestão de arquitetura de software focada em Clean Architecture e padrões de Clean Code baseada nos requisitos.",
+                description: "Fornece uma sugestao de arquitetura de software focada em Clean Architecture e padroes de Clean Code baseada nos requisitos.",
                 inputSchema: {
                     type: "object",
                     properties: {
                         tipo_projeto: {
                             type: "string",
                             description: "O tipo de projeto (ex: api_rest, web_frontend, mobile, cli).",
-                            enum: ["api_rest", "web_frontend", "mobile", "cli", "outro"]
+                            enum: ["api_rest", "web_frontend", "mobile", "cli", "outro"],
                         },
                     },
                     required: ["tipo_projeto"],
@@ -79,19 +192,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "salvar_documento",
-                description: "Salva a documentação gerada (EARS, Arquitetura, etc.) em um arquivo no diretório do projeto.",
+                description: "Salva a documentacao gerada (EARS, Arquitetura, etc.) em um arquivo no diretorio do projeto.",
                 inputSchema: {
                     type: "object",
-                    properties: {
+                    properties: withProjectRoot({
                         caminho_arquivo: {
                             type: "string",
                             description: "Caminho relativo para salvar o arquivo (ex: docs/requisitos.md)",
                         },
                         conteudo: {
                             type: "string",
-                            description: "O conteúdo Markdown a ser salvo.",
+                            description: "O conteudo Markdown a ser salvo.",
                         },
-                    },
+                    }),
                     required: ["caminho_arquivo", "conteudo"],
                 },
             },
@@ -100,13 +213,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Gera automaticamente a estrutura de pastas do projeto baseada na Clean Architecture sugerida. Executada a partir da raiz do projeto.",
                 inputSchema: {
                     type: "object",
-                    properties: {
+                    properties: withProjectRoot({
                         pastas: {
                             type: "array",
                             items: { type: "string" },
                             description: "Lista de caminhos relativos de pastas para criar (ex: src/components, src/pages, src/services).",
                         },
-                    },
+                    }),
                     required: ["pastas"],
                 },
             },
@@ -115,7 +228,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Cria um arquivo Markdown com um plano de tarefas (checkboxes) para guiar o desenvolvimento.",
                 inputSchema: {
                     type: "object",
-                    properties: {
+                    properties: withProjectRoot({
                         tarefas: {
                             type: "array",
                             items: { type: "string" },
@@ -124,8 +237,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         caminho_arquivo: {
                             type: "string",
                             description: "Caminho relativo para salvar o plano (ex: docs/tarefas.md)",
-                        }
-                    },
+                        },
+                    }),
                     required: ["tarefas", "caminho_arquivo"],
                 },
             },
@@ -134,10 +247,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Gera e salva um diagrama de arquitetura ou fluxo em formato Mermaid (.mmd).",
                 inputSchema: {
                     type: "object",
-                    properties: {
-                        caminho_arquivo: { type: "string", description: "Caminho relativo para salvar o arquivo (ex: docs/arquitetura.mmd)" },
-                        codigo_mermaid: { type: "string", description: "O código fonte do diagrama Mermaid." }
-                    },
+                    properties: withProjectRoot({
+                        caminho_arquivo: {
+                            type: "string",
+                            description: "Caminho relativo para salvar o arquivo (ex: docs/arquitetura.mmd)",
+                        },
+                        codigo_mermaid: {
+                            type: "string",
+                            description: "O codigo fonte do diagrama Mermaid.",
+                        },
+                    }),
                     required: ["caminho_arquivo", "codigo_mermaid"],
                 },
             },
@@ -146,402 +265,442 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Gera um arquivo main.yml de CI/CD para GitHub Actions baseado na stack do projeto.",
                 inputSchema: {
                     type: "object",
-                    properties: {
-                        stack: { type: "string", description: "Stack do projeto (ex: node, python, java)" },
+                    properties: withProjectRoot({
+                        stack: {
+                            type: "string",
+                            description: "Stack do projeto (ex: node, python, java)",
+                        },
                         passos: {
                             type: "array",
                             items: { type: "string" },
-                            description: "Lista de passos como 'lint', 'test', 'build'."
-                        }
-                    },
+                            description: "Lista de passos como 'lint', 'test', 'build'.",
+                        },
+                    }),
                     required: ["stack"],
                 },
             },
             {
                 name: "auditoria_dependencias",
-                description: "Executa 'npm audit' no projeto para identificar vulnerabilidades de segurança.",
+                description: "Executa 'npm audit' no projeto para identificar vulnerabilidades de seguranca.",
                 inputSchema: {
                     type: "object",
-                    properties: {}
+                    properties: withProjectRoot(),
                 },
             },
             {
                 name: "analisar_esquema_banco",
-                description: "Lê o arquivo de Schema do Banco de Dados (.sql, .prisma) para que a IA possa analisar as entidades.",
+                description: "Le o arquivo de Schema do Banco de Dados (.sql, .prisma) para que a IA possa analisar as entidades.",
                 inputSchema: {
                     type: "object",
-                    properties: {
-                        caminho_arquivo: { type: "string", description: "Caminho do arquivo de schema (ex: prisma/schema.prisma, database/schema.sql)" }
-                    },
+                    properties: withProjectRoot({
+                        caminho_arquivo: {
+                            type: "string",
+                            description: "Caminho do arquivo de schema (ex: prisma/schema.prisma, database/schema.sql)",
+                        },
+                    }),
                     required: ["caminho_arquivo"],
                 },
             },
             {
                 name: "ler_contexto_da_arquitetura",
-                description: "Lê o arquivo de contexto da arquitetura (Cérebro do Projeto - AI_CONTEXT.md) para entender as regras, stack e peculiaridades antes de codificar.",
+                description: "Le o arquivo de contexto da arquitetura (AI_CONTEXT.md) para entender as regras, stack e peculiaridades antes de codificar.",
                 inputSchema: {
                     type: "object",
-                    properties: {}
+                    properties: withProjectRoot(),
                 },
             },
             {
                 name: "atualizar_contexto_da_arquitetura",
-                description: "Adiciona novos aprendizados, regras de negócio ou decisões técnicas ao arquivo de contexto da arquitetura (AI_CONTEXT.md) para memória futura.",
+                description: "Adiciona novos aprendizados, regras de negocio ou decisoes tecnicas ao arquivo de contexto da arquitetura (AI_CONTEXT.md) para memoria futura.",
                 inputSchema: {
                     type: "object",
-                    properties: {
-                        nova_regra: { type: "string", description: "A nova regra, peculiaridade ou decisão a ser adicionada ao documento." }
-                    },
+                    properties: withProjectRoot({
+                        nova_regra: {
+                            type: "string",
+                            description: "A nova regra, peculiaridade ou decisao a ser adicionada ao documento.",
+                        },
+                    }),
                     required: ["nova_regra"],
                 },
             },
             {
                 name: "gerar_esqueleto_de_testes",
-                description: "Gera a estrutura inicial de arquivos de testes unitários baseados nos requisitos EARS (TDD Scaffold).",
+                description: "Gera a estrutura inicial de arquivos de testes unitarios baseados nos requisitos EARS (TDD Scaffold).",
                 inputSchema: {
                     type: "object",
-                    properties: {
-                        caminho_arquivo: { type: "string", description: "Caminho do arquivo de teste a ser gerado (ex: tests/auth.spec.ts)" },
-                        framework: { type: "string", description: "Framework de testes (ex: jest, vitest, rspec)" },
+                    properties: withProjectRoot({
+                        caminho_arquivo: {
+                            type: "string",
+                            description: "Caminho do arquivo de teste a ser gerado (ex: tests/auth.spec.ts)",
+                        },
+                        framework: {
+                            type: "string",
+                            description: "Framework de testes (ex: jest, vitest, rspec)",
+                        },
                         cenarios: {
                             type: "array",
                             items: { type: "string" },
-                            description: "Lista de descrições dos cenários a serem testados (extraídos do Event-Driven/State-Driven do EARS)."
-                        }
-                    },
+                            description: "Lista de descricoes dos cenarios a serem testados (extraidos do Event-Driven/State-Driven do EARS).",
+                        },
+                    }),
                     required: ["caminho_arquivo", "framework", "cenarios"],
                 },
             },
             {
                 name: "commit_small_release",
-                description: "Automatiza um Small Release seguro: Roda Lint e Testes localmente. Se passarem, realiza um git commit protegido.",
+                description: "Automatiza um Small Release seguro: roda lint e testes localmente. Se passarem, realiza um git commit protegido.",
                 inputSchema: {
                     type: "object",
-                    properties: {
-                        mensagem_commit: { type: "string", description: "Mensagem descritiva do commit no padrão Conventional Commits (ex: feat: adiciona login)." }
-                    },
+                    properties: withProjectRoot({
+                        mensagem_commit: {
+                            type: "string",
+                            description: "Mensagem descritiva do commit no padrao Conventional Commits (ex: feat: adiciona login).",
+                        },
+                    }),
                     required: ["mensagem_commit"],
                 },
-            }
+            },
         ],
     };
 });
-// Implementa a lógica de execução de cada ferramenta do Arquiteto
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const toolName = request.params.name;
-    const args = request.params.arguments || {};
-    // Helper functions
-    const safeWriteFile = (filePath, content) => {
-        // O Node CWD de um app sendo gerenciado pelo Claude/Cursor geralmente é a raiz do diretório do projeto onde o AI foi acionado
-        const absolutePath = path.resolve(process.cwd(), filePath);
-        const dir = path.dirname(absolutePath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        fs.writeFileSync(absolutePath, content, "utf-8");
-        return absolutePath;
-    };
+    const args = (request.params.arguments ?? {});
     if (toolName === "iniciar_planejamento_projeto") {
-        const objetivo = args.objetivo_principal;
-        const tecnologias = args.tecnologias_desejadas || ["A definir"];
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Iniciando planejamento Spec-Driven para o objetivo: "${objetivo}".\nTecnologias consideradas: ${tecnologias.join(", ")}.\n\nPasso 1: Vamos coletar e refinar os requisitos. Por favor, detalhe as funcionalidades chave preenchendo as condições (condicao_previa, evento_gatilho, resposta_esperada) para prosseguir com a declaração EARS usando 'gerar_documento_requisitos_ears'.`,
-                },
-            ],
-        };
+        const objetivo = getStringArg(args, "objetivo_principal");
+        const tecnologias = getStringArrayArg(args, "tecnologias_desejadas") ?? [
+            "A definir",
+        ];
+        if (!objetivo) {
+            return textResponse("Parametro obrigatorio ausente: objetivo_principal.", true);
+        }
+        return textResponse(`Iniciando planejamento Spec-Driven para o objetivo: "${objetivo}".\nTecnologias consideradas: ${tecnologias.join(", ")}.\n\nPasso 1: detalhe as funcionalidades chave preenchendo condicao_previa, evento_gatilho e resposta_esperada para prosseguir com a declaracao EARS usando 'gerar_documento_requisitos_ears'.`);
     }
     if (toolName === "gerar_documento_requisitos_ears") {
-        const funcionalidades = args.funcionalidades;
-        let docEars = "# Documento de Requisitos (Formato EARS)\n\n";
-        funcionalidades.forEach((func, index) => {
-            docEars += `## Funcionalidade ${index + 1}: ${func.nome}\n`;
-            docEars += `- **Ubiquitous (Sempre):** O sistema deve fornecer a capacidade de realizar a funcionalidade ${func.nome}.\n`;
-            docEars += `- **Event-Driven (Quando):** Quando ${func.evento_gatilho}, o sistema deve ${func.resposta_esperada}.\n`;
-            docEars += `- **State-Driven (Enquanto):** Enquanto ${func.condicao_previa}, o sistema deve permitir ${func.nome}.\n\n`;
+        const funcionalidades = (args.funcionalidades ?? []);
+        let documento = "# Documento de Requisitos (Formato EARS)\n\n";
+        funcionalidades.forEach((funcionalidade, index) => {
+            documento += `## Funcionalidade ${index + 1}: ${funcionalidade.nome}\n`;
+            documento += `- **Ubiquitous (Sempre):** O sistema deve fornecer a capacidade de realizar a funcionalidade ${funcionalidade.nome}.\n`;
+            documento += `- **Event-Driven (Quando):** Quando ${funcionalidade.evento_gatilho}, o sistema deve ${funcionalidade.resposta_esperada}.\n`;
+            documento += `- **State-Driven (Enquanto):** Enquanto ${funcionalidade.condicao_previa}, o sistema deve permitir ${funcionalidade.nome}.\n\n`;
         });
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: docEars + "\nRequisitos baseados em EARS gerados com sucesso. O próximo passo é invocar a sugestão de design arquitetural em Clean Code, ou você já pode salvar este documento com a ferramenta 'salvar_documento'.",
-                },
-            ],
-        };
+        return textResponse(`${documento}Requisitos baseados em EARS gerados com sucesso. O proximo passo e invocar a sugestao de design arquitetural em Clean Code, ou salvar este documento com a ferramenta 'salvar_documento'.`);
     }
     if (toolName === "sugerir_arquitetura_clean_code") {
-        const tipo = args.tipo_projeto;
-        let sugestao = "";
+        const tipo = getStringArg(args, "tipo_projeto");
         if (tipo === "api_rest") {
-            sugestao = "Sugestão de Arquitetura Limpa para API REST:\n- **Domain Layer:** Entidades e Casos de Uso (sem dependências externas).\n- **Interface Adapters:** Controllers, Presenters e Gateways.\n- **Frameworks & Drivers:** Banco de dados, Web Server (Express/Fastify).\n\nPráticas: Injeção de dependência e princípios SOLID.\n\nVocê pode gerar a estrutura de pastas usando a ferramenta 'gerar_estrutura_pastas'.";
+            return textResponse("Sugestao de Arquitetura Limpa para API REST:\n- **Domain Layer:** Entidades e Casos de Uso (sem dependencias externas).\n- **Interface Adapters:** Controllers, Presenters e Gateways.\n- **Frameworks & Drivers:** Banco de dados e Web Server (Express/Fastify).\n\nPraticas: injecao de dependencia e principios SOLID.\n\nVoce pode gerar a estrutura de pastas usando a ferramenta 'gerar_estrutura_pastas'.");
         }
-        else if (tipo === "web_frontend") {
-            sugestao = "Sugestão de Arquitetura para Frontend Web:\n- **Components Layer:** Componentes de UI burros (Dumb Components).\n- **Containers/Pages:** Componentes inteligentes conectados ao estado.\n- **Services/Hooks:** Lógica de negócio e chamadas de API encapsuladas.\n- **Store:** Gerenciamento de estado global (se necessário).\n\nPráticas: Separação de responsabilidades, Custom Hooks para lógica.\n\nVocê pode gerar a estrutura de pastas usando a ferramenta 'gerar_estrutura_pastas'.";
+        if (tipo === "web_frontend") {
+            return textResponse("Sugestao de Arquitetura para Frontend Web:\n- **Components Layer:** Componentes de UI burros (dumb components).\n- **Containers/Pages:** Componentes inteligentes conectados ao estado.\n- **Services/Hooks:** Logica de negocio e chamadas de API encapsuladas.\n- **Store:** Gerenciamento de estado global (se necessario).\n\nPraticas: separacao de responsabilidades e custom hooks para logica.\n\nVoce pode gerar a estrutura de pastas usando a ferramenta 'gerar_estrutura_pastas'.");
         }
-        else {
-            sugestao = "Para este tipo de projeto, foque em modularização, baixo acoplamento e alta coesão, mantendo a regra de dependência apontando para as políticas de alto nível.\n\nVocê pode criar as pastas iniciais usando 'gerar_estrutura_pastas'.";
-        }
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: sugestao,
-                },
-            ],
-        };
+        return textResponse("Para este tipo de projeto, foque em modularizacao, baixo acoplamento e alta coesao, mantendo a regra de dependencia apontando para as politicas de alto nivel.\n\nVoce pode criar as pastas iniciais usando 'gerar_estrutura_pastas'.");
     }
     if (toolName === "salvar_documento") {
-        const caminho_arquivo = args.caminho_arquivo;
-        const conteudo = args.conteudo;
-        try {
-            const fullPath = safeWriteFile(caminho_arquivo, conteudo);
-            return {
-                content: [{ type: "text", text: `Documento salvo com sucesso em: ${fullPath}` }]
-            };
+        const projectRoot = resolveProjectRoot(args);
+        const caminhoArquivo = getStringArg(args, "caminho_arquivo");
+        const conteudo = getStringArg(args, "conteudo");
+        if (!caminhoArquivo || conteudo === undefined) {
+            return textResponse("Parametros obrigatorios ausentes: caminho_arquivo e conteudo.", true);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Erro ao salvar documento: ${err.message}` }],
-                isError: true
-            };
+        try {
+            const fullPath = safeWriteFile(projectRoot, caminhoArquivo, conteudo);
+            return textResponse(`Documento salvo com sucesso em: ${fullPath}\n${formatProjectRoot(projectRoot)}`);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao salvar documento: ${message}`, true);
         }
     }
     if (toolName === "gerar_estrutura_pastas") {
-        const pastas = args.pastas;
-        const caminhosCriados = [];
+        const projectRoot = resolveProjectRoot(args);
+        const pastas = getStringArrayArg(args, "pastas");
+        if (!pastas) {
+            return textResponse("Parametro obrigatorio ausente: pastas.", true);
+        }
         try {
-            pastas.forEach(pasta => {
-                const absolutePath = path.resolve(process.cwd(), pasta);
+            const caminhosCriados = [];
+            pastas.forEach((pasta) => {
+                const absolutePath = resolveProjectPath(projectRoot, pasta);
                 if (!fs.existsSync(absolutePath)) {
                     fs.mkdirSync(absolutePath, { recursive: true });
                 }
-                caminhosCriados.push(pasta);
+                caminhosCriados.push(absolutePath);
             });
-            return {
-                content: [{ type: "text", text: `Estrutura de pastas gerada com sucesso:\n- ${caminhosCriados.join("\n- ")}` }]
-            };
+            return textResponse(`Estrutura de pastas gerada com sucesso:\n- ${caminhosCriados.join("\n- ")}\n${formatProjectRoot(projectRoot)}`);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Erro ao criar estrutura de pastas: ${err.message}` }],
-                isError: true
-            };
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao criar estrutura de pastas: ${message}`, true);
         }
     }
     if (toolName === "criar_plano_de_tarefas") {
-        const tarefas = args.tarefas;
-        const caminho_arquivo = args.caminho_arquivo;
+        const projectRoot = resolveProjectRoot(args);
+        const tarefas = getStringArrayArg(args, "tarefas");
+        const caminhoArquivo = getStringArg(args, "caminho_arquivo");
+        if (!tarefas || !caminhoArquivo) {
+            return textResponse("Parametros obrigatorios ausentes: tarefas e caminho_arquivo.", true);
+        }
         let conteudo = "# Plano de Tarefas\n\n";
-        tarefas.forEach(tarefa => {
+        tarefas.forEach((tarefa) => {
             conteudo += `- [ ] ${tarefa}\n`;
         });
         try {
-            const fullPath = safeWriteFile(caminho_arquivo, conteudo);
-            return {
-                content: [{ type: "text", text: `Plano de tarefas criado com sucesso em: ${fullPath}\nAbra o arquivo para acompanhar o progresso marcando os checkboxes.` }]
-            };
+            const fullPath = safeWriteFile(projectRoot, caminhoArquivo, conteudo);
+            return textResponse(`Plano de tarefas criado com sucesso em: ${fullPath}\n${formatProjectRoot(projectRoot)}`);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Erro ao criar plano de tarefas: ${err.message}` }],
-                isError: true
-            };
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao criar plano de tarefas: ${message}`, true);
         }
     }
     if (toolName === "gerar_diagrama_mermaid") {
-        const caminho_arquivo = args.caminho_arquivo;
-        const codigo_mermaid = args.codigo_mermaid;
-        try {
-            const fullPath = safeWriteFile(caminho_arquivo, codigo_mermaid);
-            return {
-                content: [{ type: "text", text: `Diagrama Mermaid salvo com sucesso em: ${fullPath}` }]
-            };
+        const projectRoot = resolveProjectRoot(args);
+        const caminhoArquivo = getStringArg(args, "caminho_arquivo");
+        const codigoMermaid = getStringArg(args, "codigo_mermaid");
+        if (!caminhoArquivo || codigoMermaid === undefined) {
+            return textResponse("Parametros obrigatorios ausentes: caminho_arquivo e codigo_mermaid.", true);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Erro ao salvar diagrama mermaid: ${err.message}` }],
-                isError: true
-            };
+        try {
+            const fullPath = safeWriteFile(projectRoot, caminhoArquivo, codigoMermaid);
+            return textResponse(`Diagrama Mermaid salvo com sucesso em: ${fullPath}\n${formatProjectRoot(projectRoot)}`);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao salvar diagrama Mermaid: ${message}`, true);
         }
     }
     if (toolName === "gerar_pipeline_github_actions") {
-        const stack = args.stack;
-        const passos = args.passos || ["install", "test"];
-        const caminho_arquivo = ".github/workflows/main.yml";
-        let actionsCode = `name: CI/CD Pipeline\n\non:\n  push:\n    branches: [ "main" ]\n  pull_request:\n    branches: [ "main" ]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n`;
+        const projectRoot = resolveProjectRoot(args);
+        const stack = getStringArg(args, "stack");
+        const passos = getStringArrayArg(args, "passos") ?? ["install", "test"];
+        const caminhoArquivo = ".github/workflows/main.yml";
+        if (!stack) {
+            return textResponse("Parametro obrigatorio ausente: stack.", true);
+        }
+        let actionsCode = 'name: CI/CD Pipeline\n\non:\n  push:\n    branches: [ "main" ]\n  pull_request:\n    branches: [ "main" ]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n';
         if (stack.toLowerCase() === "node" || stack.toLowerCase() === "react") {
-            actionsCode += `      - name: Use Node.js\n        uses: actions/setup-node@v4\n        with:\n          node-version: "20.x"\n`;
-            if (passos.includes("install"))
-                actionsCode += `      - run: npm install\n`;
-            if (passos.includes("lint"))
-                actionsCode += `      - run: npm run lint\n`;
-            if (passos.includes("test"))
-                actionsCode += `      - run: npm test\n`;
-            if (passos.includes("build"))
-                actionsCode += `      - run: npm run build\n`;
+            actionsCode +=
+                '      - name: Use Node.js\n        uses: actions/setup-node@v4\n        with:\n          node-version: "20.x"\n';
+            if (passos.includes("install")) {
+                actionsCode += "      - run: npm install\n";
+            }
+            if (passos.includes("lint")) {
+                actionsCode += "      - run: npm run lint\n";
+            }
+            if (passos.includes("test")) {
+                actionsCode += "      - run: npm test\n";
+            }
+            if (passos.includes("build")) {
+                actionsCode += "      - run: npm run build\n";
+            }
         }
         else {
-            actionsCode += `      - run: echo "Estrutura para ${stack} gerada de forma genérica"\n`;
+            actionsCode += `      - run: echo "Estrutura para ${stack} gerada de forma generica"\n`;
         }
         try {
-            const fullPath = safeWriteFile(caminho_arquivo, actionsCode);
-            return {
-                content: [{ type: "text", text: `Pipeline Github Actions gerado em: ${fullPath}` }]
-            };
+            const fullPath = safeWriteFile(projectRoot, caminhoArquivo, actionsCode);
+            return textResponse(`Pipeline GitHub Actions gerado em: ${fullPath}\n${formatProjectRoot(projectRoot)}`);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Erro ao gerar pipeline: ${err.message}` }],
-                isError: true
-            };
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao gerar pipeline: ${message}`, true);
         }
     }
     if (toolName === "auditoria_dependencias") {
+        const projectRoot = resolveProjectRoot(args);
         try {
-            const projectPath = process.cwd();
-            const { stdout, stderr } = await execPromise("npm audit", { cwd: projectPath });
-            return {
-                content: [{ type: "text", text: `Relatório de Auditoria (NPM Audit):\n${stdout}\n${stderr}` }]
-            };
+            readPackageJson(projectRoot);
+            const { stdout, stderr } = await runFileCommand(npmCommand, ["audit"], projectRoot);
+            return textResponse(`Relatorio de Auditoria (npm audit):\n${stdout}\n${stderr}\n${formatProjectRoot(projectRoot)}`);
         }
-        catch (err) {
-            if (err.stdout) {
-                return {
-                    content: [{ type: "text", text: `Relatório de Auditoria (Vulnerabilidades Encontradas):\n${err.stdout}` }]
-                };
+        catch (error) {
+            if (typeof error === "object" &&
+                error !== null &&
+                "stdout" in error &&
+                typeof error.stdout === "string") {
+                return textResponse(`Relatorio de Auditoria (vulnerabilidades encontradas):\n${error.stdout}\n${formatProjectRoot(projectRoot)}`);
             }
-            return {
-                content: [{ type: "text", text: `Erro ao executar auditoria: ${err.message}` }],
-                isError: true
-            };
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao executar auditoria: ${message}`, true);
         }
     }
     if (toolName === "analisar_esquema_banco") {
-        const caminho_arquivo = args.caminho_arquivo;
+        const projectRoot = resolveProjectRoot(args);
+        const caminhoArquivo = getStringArg(args, "caminho_arquivo");
+        if (!caminhoArquivo) {
+            return textResponse("Parametro obrigatorio ausente: caminho_arquivo.", true);
+        }
         try {
-            const absolutePath = path.resolve(process.cwd(), caminho_arquivo);
+            const absolutePath = resolveProjectPath(projectRoot, caminhoArquivo);
             if (!fs.existsSync(absolutePath)) {
-                return {
-                    content: [{ type: "text", text: `O arquivo de schema não foi encontrado em: ${absolutePath}. Certifique-se de usar o caminho correto.` }],
-                    isError: true
-                };
+                return textResponse(`O arquivo de schema nao foi encontrado em: ${absolutePath}.\n${formatProjectRoot(projectRoot)}`, true);
             }
             const conteudo = fs.readFileSync(absolutePath, "utf-8");
-            return {
-                content: [{ type: "text", text: `Conteúdo do Schema do Banco de Dados (${caminho_arquivo}):\n\n${conteudo}` }]
-            };
+            return textResponse(`Conteudo do Schema do Banco de Dados (${caminhoArquivo}):\n\n${conteudo}\n${formatProjectRoot(projectRoot)}`);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Erro ao ler o esquema do banco: ${err.message}` }],
-                isError: true
-            };
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao ler o esquema do banco: ${message}`, true);
         }
     }
     if (toolName === "ler_contexto_da_arquitetura") {
-        const contextPath = path.resolve(process.cwd(), "AI_CONTEXT.md");
+        const projectRoot = resolveProjectRoot(args);
+        const contextPath = path.join(projectRoot, "AI_CONTEXT.md");
         if (!fs.existsSync(contextPath)) {
-            return {
-                content: [{ type: "text", text: `Arquivo AI_CONTEXT.md não encontrado. O projeto ainda não possui um contexto registrado.` }]
-            };
+            return textResponse(`Arquivo AI_CONTEXT.md nao encontrado.\n${formatProjectRoot(projectRoot)}`);
         }
         const conteudo = fs.readFileSync(contextPath, "utf-8");
-        return {
-            content: [{ type: "text", text: `Contexto do Projeto (Regras e Decisões):\n\n${conteudo}` }]
-        };
+        return textResponse(`Contexto do Projeto (Regras e Decisoes):\n\n${conteudo}\n${formatProjectRoot(projectRoot)}`);
     }
     if (toolName === "atualizar_contexto_da_arquitetura") {
-        const novaRegra = args.nova_regra;
-        const contextPath = path.resolve(process.cwd(), "AI_CONTEXT.md");
-        let currentContent = "# Contexto da Arquitetura & Decisões do Projeto\n\nEste documento evolui com o projeto. Ele contém regras de negócio, decisões técnicas e stack.\n\n## Regras Descobertas e Adicionadas:\n";
+        const projectRoot = resolveProjectRoot(args);
+        const novaRegra = getStringArg(args, "nova_regra");
+        if (!novaRegra) {
+            return textResponse("Parametro obrigatorio ausente: nova_regra.", true);
+        }
+        const contextPath = path.join(projectRoot, "AI_CONTEXT.md");
+        let currentContent = "# Contexto da Arquitetura & Decisoes do Projeto\n\nEste documento evolui com o projeto. Ele contem regras de negocio, decisoes tecnicas e stack.\n\n## Regras Descobertas e Adicionadas:\n";
         if (fs.existsSync(contextPath)) {
             currentContent = fs.readFileSync(contextPath, "utf-8");
         }
         const timeNow = new Date().toISOString().split("T")[0];
         const newContent = `${currentContent}\n- [${timeNow}] ${novaRegra}`;
-        fs.writeFileSync(contextPath, newContent, "utf-8");
-        return {
-            content: [{ type: "text", text: `Contexto do projeto atualizado com sucesso no arquivo AI_CONTEXT.md.` }]
-        };
+        try {
+            safeWriteFile(projectRoot, "AI_CONTEXT.md", newContent);
+            return textResponse(`Contexto do projeto atualizado com sucesso no arquivo AI_CONTEXT.md.\n${formatProjectRoot(projectRoot)}`);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao atualizar o contexto: ${message}`, true);
+        }
     }
     if (toolName === "gerar_esqueleto_de_testes") {
-        const caminho = args.caminho_arquivo;
-        const fw = args.framework.toLowerCase();
-        const cenarios = args.cenarios;
+        const projectRoot = resolveProjectRoot(args);
+        const caminho = getStringArg(args, "caminho_arquivo");
+        const framework = getStringArg(args, "framework");
+        const cenarios = getStringArrayArg(args, "cenarios");
+        if (!caminho || !framework || !cenarios) {
+            return textResponse("Parametros obrigatorios ausentes: caminho_arquivo, framework e cenarios.", true);
+        }
         let testCode = "";
-        if (fw === "jest" || fw === "vitest") {
+        const frameworkNormalizado = framework.toLowerCase();
+        if (frameworkNormalizado === "jest" || frameworkNormalizado === "vitest") {
             const moduleName = path.basename(caminho).split(".")[0];
-            testCode += `import { describe, it, expect } from '${fw}';\n\n`;
+            testCode += `import { describe, it, expect } from '${frameworkNormalizado}';\n\n`;
             testCode += `describe('${moduleName} module', () => {\n`;
-            cenarios.forEach(cenario => {
-                testCode += `  it('deve ${cenario}', () => {\n    // TODO: Implementar teste antes da lógica (TDD)\n    expect(true).toBe(false);\n  });\n\n`;
+            cenarios.forEach((cenario) => {
+                testCode +=
+                    `  it('deve ${cenario}', () => {\n` +
+                        "    // TODO: Implementar teste antes da logica (TDD)\n" +
+                        "    expect(true).toBe(false);\n" +
+                        "  });\n\n";
             });
-            testCode += `});\n`;
+            testCode += "});\n";
         }
         else {
-            testCode = `// Esqueleto de testes para ${fw}\n// Cenários a cobrir:\n`;
-            cenarios.forEach(c => testCode += `// - ${c}\n`);
+            testCode = `// Esqueleto de testes para ${frameworkNormalizado}\n// Cenarios a cobrir:\n`;
+            cenarios.forEach((cenario) => {
+                testCode += `// - ${cenario}\n`;
+            });
         }
         try {
-            const fullPath = safeWriteFile(caminho, testCode);
-            return {
-                content: [{ type: "text", text: `Esqueleto TDD gerado com falhas intencionais em: ${fullPath}\n\nATENÇÃO IA: Execute os testes, observe a falha, DEPOIS implemente a feature para fazer o teste passar.` }]
-            };
+            const fullPath = safeWriteFile(projectRoot, caminho, testCode);
+            return textResponse(`Esqueleto TDD gerado com falhas intencionais em: ${fullPath}\n${formatProjectRoot(projectRoot)}`);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Erro ao gerar scaffold de testes: ${err.message}` }],
-                isError: true
-            };
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Erro ao gerar scaffold de testes: ${message}`, true);
         }
     }
     if (toolName === "commit_small_release") {
-        const msg = args.mensagem_commit;
-        const projectPath = process.cwd();
+        const projectRoot = resolveProjectRoot(args);
+        const message = getStringArg(args, "mensagem_commit");
+        if (!message) {
+            return textResponse("Parametro obrigatorio ausente: mensagem_commit.", true);
+        }
         try {
-            // 1. Tentar rodar lint (se existir no package.json)
-            try {
-                const pkgTxt = fs.readFileSync(path.join(projectPath, 'package.json'), 'utf-8');
-                if (pkgTxt.includes('"lint"')) {
-                    await execPromise("npm run lint", { cwd: projectPath });
+            const { scripts } = readPackageJson(projectRoot);
+            const observacoes = [];
+            if (scripts.lint) {
+                try {
+                    await runFileCommand(npmCommand, ["run", "lint"], projectRoot);
+                }
+                catch (error) {
+                    const stdout = typeof error === "object" &&
+                        error !== null &&
+                        "stdout" in error &&
+                        typeof error.stdout === "string"
+                        ? error.stdout
+                        : "";
+                    const stderr = typeof error === "object" &&
+                        error !== null &&
+                        "stderr" in error &&
+                        typeof error.stderr === "string"
+                        ? error.stderr
+                        : "";
+                    return textResponse(`COMMIT BLOQUEADO: o lint falhou.\n\n${stdout}\n${stderr}\n${formatProjectRoot(projectRoot)}`, true);
                 }
             }
-            catch (err) { /* linter falhou ou não existe, ignorar no nosso scaffold base mas idealmente falharia */ }
-            // 2. Rodar testes obrigatoriamente
+            else {
+                observacoes.push("Script de lint ausente; etapa ignorada.");
+            }
+            if (!scripts.test) {
+                return textResponse(`COMMIT BLOQUEADO: o projeto nao possui script de testes em package.json.\n${formatProjectRoot(projectRoot)}`, true);
+            }
+            if (scripts.test.includes("no test specified")) {
+                return textResponse(`COMMIT BLOQUEADO: o script de testes ainda e o placeholder padrao do npm.\n${formatProjectRoot(projectRoot)}`, true);
+            }
             try {
-                await execPromise("npm test", { cwd: projectPath });
+                await runFileCommand(npmCommand, ["test"], projectRoot);
             }
-            catch (err) {
-                return {
-                    content: [{ type: "text", text: `✋ COMMIT BLOQUEADO: Os testes falharam! Você deve corrigir o código antes de commitar.\n\nLogs:\n${err.stdout || err.message}` }],
-                    isError: true
-                };
+            catch (error) {
+                const stdout = typeof error === "object" &&
+                    error !== null &&
+                    "stdout" in error &&
+                    typeof error.stdout === "string"
+                    ? error.stdout
+                    : "";
+                const stderr = typeof error === "object" &&
+                    error !== null &&
+                    "stderr" in error &&
+                    typeof error.stderr === "string"
+                    ? error.stderr
+                    : "";
+                return textResponse(`COMMIT BLOQUEADO: os testes falharam.\n\n${stdout}\n${stderr}\n${formatProjectRoot(projectRoot)}`, true);
             }
-            // 3. Se testes passarem, faz o commit
-            await execPromise("git add .", { cwd: projectPath });
-            const { stdout } = await execPromise(`git commit -m "${msg}"`, { cwd: projectPath });
-            return {
-                content: [{ type: "text", text: `✅ Small Release concluído com sucesso! (Testes passaram, código commitado).\n\n${stdout}` }]
-            };
+            try {
+                await ensureGitRepository(projectRoot);
+            }
+            catch {
+                return textResponse(`COMMIT BLOQUEADO: o diretorio resolvido nao esta dentro de um repositorio git.\n${formatProjectRoot(projectRoot)}`, true);
+            }
+            await runFileCommand("git", ["add", "-A", "."], projectRoot);
+            const staged = await runFileCommand("git", ["diff", "--cached", "--name-only"], projectRoot);
+            if (!staged.stdout.trim()) {
+                return textResponse(`Nenhuma alteracao staged para commitar.\n${formatProjectRoot(projectRoot)}`, true);
+            }
+            const commitResult = await runFileCommand("git", ["commit", "-m", message], projectRoot);
+            const observacoesTexto = observacoes.length > 0
+                ? `\nObservacoes:\n- ${observacoes.join("\n- ")}`
+                : "";
+            return textResponse(`Small Release concluido com sucesso.\n\n${commitResult.stdout}${observacoesTexto}\n${formatProjectRoot(projectRoot)}`);
         }
-        catch (err) {
-            return {
-                content: [{ type: "text", text: `Falha na esteira de commit: ${err.message}` }],
-                isError: true
-            };
+        catch (error) {
+            const detail = error instanceof Error ? error.message : "Erro desconhecido.";
+            return textResponse(`Falha na esteira de commit: ${detail}`, true);
         }
     }
-    throw new Error(`Ferramenta não suportada pelo Arquiteto: ${toolName}`);
+    throw new Error(`Ferramenta nao suportada pelo Arquiteto: ${toolName}`);
 });
-// Inicialização do Servidor MCP
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("Spec-Driven Architect MCP Server inciado com sucesso! Aguardando chamadas stdio da IA.");
+    const startupRoot = configuredProjectRoot ?? process.cwd();
+    console.error(`AI Architect MCP Server iniciado com sucesso. Projeto padrao: ${startupRoot}`);
 }
 main().catch((error) => {
-    console.error("Erro fatal na inicialização:", error);
+    console.error("Erro fatal na inicializacao:", error);
     process.exit(1);
 });
